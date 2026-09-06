@@ -1,0 +1,470 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# ASES Production Stack - Multi-Container Architecture
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+  # ─────────────────────────────────────────────────────────────────────────
+  # LAYER 4: PostgreSQL (Primary Data Store)
+  # ─────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ases-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ases}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ases_secure_password_$(openssl rand -hex 8)}
+      POSTGRES_DB: ${POSTGRES_DB:-ases_production}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - type: volume
+        source: postgres_data
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ./database/init.sql
+        target: /docker-entrypoint-initdb.d/01-init.sql
+        read_only: true
+
+    ports:
+      - "127.0.0.1:5432:5432"  # Localhost only for security
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    networks:
+      - ases-backend
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # LAYER 4: Redis (Cache + Rate Limiting + Session Store)
+  # ─────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ases-redis
+    restart: unless-stopped
+
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-ases_redis_$(openssl rand -hex 8)}
+
+    volumes:
+      - type: volume
+        source: redis_data
+        target: /data
+
+    ports:
+      - "127.0.0.1:6379:6379"  # Localhost only
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+    networks:
+      - ases-backend
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # LAYER 2b: RQ Worker (async job processor — scale horizontally)
+  # ─────────────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile
+    image: ases-agent:latest
+    command: python worker.py
+    restart: unless-stopped
+
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      VERCEL_TOKEN: ${VERCEL_TOKEN:-}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ases}:${POSTGRES_PASSWORD:-ases_secure_password}@postgres:5432/${POSTGRES_DB:-ases_production}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ases_redis_password}@redis:6379/0
+      SANDBOX_BASE_DIR: /app/sandboxes
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STRUCTLOG_FORMAT: json
+
+    volumes:
+      - type: volume
+        source: agent_sandboxes
+        target: /app/sandboxes
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+
+    deploy:
+      replicas: 2       # initial pool; autoscaler will add/remove beyond this
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  autoscaler:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile
+    image: ases-agent:latest
+    command: python autoscaler.py
+    restart: unless-stopped
+
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ases_redis_password}@redis:6379/0
+      AUTOSCALER_MIN_WORKERS: ${AUTOSCALER_MIN_WORKERS:-1}
+      AUTOSCALER_MAX_WORKERS: ${AUTOSCALER_MAX_WORKERS:-8}
+      AUTOSCALER_SCALE_UP_THRESHOLD: ${AUTOSCALER_SCALE_UP_THRESHOLD:-3.0}
+      AUTOSCALER_SCALE_DOWN_GRACE: ${AUTOSCALER_SCALE_DOWN_GRACE:-60}
+      AUTOSCALER_CPU_MAX: ${AUTOSCALER_CPU_MAX:-80.0}
+      AUTOSCALER_WORKER_CMD: python worker.py
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STRUCTLOG_FORMAT: json
+
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+
+    deploy:
+      replicas: 1   # exactly one autoscaler per cluster
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    networks:
+      - ases-backend
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # LAYER 2: Agent Service (FastAPI Multi-Agent Engine)
+  # ─────────────────────────────────────────────────────────────────────────
+  agent:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ases-agent:latest
+    container_name: ases-agent
+    restart: unless-stopped
+
+    environment:
+      # AI
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+
+      # GitHub
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+
+      # Vercel (optional)
+      VERCEL_TOKEN: ${VERCEL_TOKEN:-}
+
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ases}:${POSTGRES_PASSWORD:-ases_secure_password}@postgres:5432/${POSTGRES_DB:-ases_production}
+
+      # Cache
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ases_redis_password}@redis:6379/0
+
+      # Sandbox
+      SANDBOX_BASE_DIR: /app/sandboxes
+
+      # CORS — restrict to n8n and your frontend origin
+      CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://n8n:5678,https://${DOMAIN:-localhost}"
+
+      # n8n integration
+      AGENT_SERVICE_URL: http://agent:8000
+
+      # Tenant
+      TENANT_ID: ${TENANT_ID:-default}
+
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STRUCTLOG_FORMAT: json
+
+    volumes:
+      - type: volume
+        source: agent_sandboxes
+        target: /app/sandboxes
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+
+    ports:
+      - "127.0.0.1:8000:8000"  # Localhost only, proxied by Nginx
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    networks:
+      - ases-backend
+      - ases-frontend
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # LAYER 1: n8n Orchestrator (with auto-import)
+  # ─────────────────────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:1.44.0
+    container_name: ases-n8n
+    restart: unless-stopped
+
+    environment:
+      # Core
+      
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://${DOMAIN:-localhost}/
+      N8N_PROXY_HOPS:1
+
+      # Auth
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:-admin}
+
+      # Security
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-$(openssl rand -hex 32)}
+
+      # Execution
+      EXECUTIONS_MODE: regular
+      EXECUTIONS_TIMEOUT: 3600
+      EXECUTIONS_TIMEOUT_MAX: 7200
+
+      # Data
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-ases_production}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-ases}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-ases_secure_password}
+
+      # ASES integration
+      AGENT_SERVICE_URL: http://agent:8000
+
+      # Telegram
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      OUTREACH_FROM_EMAIL: ${OUTREACH_FROM_EMAIL:-}
+
+      # Generic
+      GENERIC_TIMEZONE: UTC
+      TZ: UTC
+
+    volumes:
+      - type: volume
+        source: n8n_data
+        target: /home/node/.n8n
+      - type: bind
+        source: ./n8n_orchestrator.json
+        target: /backup/workflow.json
+        # v2.5: ASES Orchestrator — HITL + DB-backed CRM + cold outreach + Redis cache
+        read_only: true
+      - type: bind
+        source: ./auto-import.sh
+        target: /backup/auto-import.sh
+        read_only: true
+
+    ports:
+      - "127.0.0.1:5678:5678"  # Localhost only, proxied by Nginx
+
+    # healthcheck:
+    #   test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+    #   interval: 15s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 60s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent:
+        condition: service_healthy
+
+    networks:
+      - ases-backend
+      - ases-frontend
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # LAYER 5: Nginx Reverse Proxy + SSL
+  # ─────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: ases-nginx
+    restart: unless-stopped
+
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+
+    volumes:
+      - type: bind
+        source: ./docker/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+      - type: bind
+        source: ./ssl
+        target: /etc/nginx/ssl
+        read_only: true
+      - type: volume
+        source: nginx_cache
+        target: /var/cache/nginx
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+    depends_on:
+      agent:
+        condition: service_healthy
+      n8n:
+        condition: service_started
+
+    networks:
+      - ases-frontend
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VOLUMES
+# ═══════════════════════════════════════════════════════════════════════════
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  n8n_data:
+    driver: local
+  agent_sandboxes:
+    driver: local
+  nginx_cache:
+    driver: local
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NETWORKS
+# ═══════════════════════════════════════════════════════════════════════════
+
+networks:
+  ases-backend:
+    driver: bridge
+    internal: true  # No external access
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+
+  ases-frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24

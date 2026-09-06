@@ -1,0 +1,42 @@
+# Core
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# AI
+openai>=1.30.0
+
+# Queue
+rq<2.0.0
+redis>=5.0.0
+
+# Database
+asyncpg>=0.29.0
+pgvector>=0.2.5            # Gap 1: vector similarity for memory retrieval
+
+# HTTP client
+httpx>=0.27.0
+
+# Logging
+structlog>=24.0.0
+
+# Utils
+python-dotenv>=1.0.0
+
+# Observability — Prometheus
+prometheus-client>=0.20.0
+
+# Observability — OpenTelemetry (optional: set OTEL_EXPORTER_OTLP_ENDPOINT to activate)
+opentelemetry-sdk>=1.24.0
+opentelemetry-exporter-otlp-proto-grpc>=1.24.0
+opentelemetry-instrumentation-fastapi>=0.45b0
+opentelemetry-instrumentation-httpx>=0.45b0
+opentelemetry-instrumentation-asyncpg>=0.45b0
+
+# Autoscaler — resource monitoring
+psutil>=5.9.0
+
+# Static analysis
+ruff>=0.4.0
+pip-audit>=2.7.0

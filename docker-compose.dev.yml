@@ -1,0 +1,80 @@
+version: "3.8"
+
+# Development mode: services split for easier debugging
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ases-postgres-dev
+    environment:
+      - POSTGRES_USER=ases
+      - POSTGRES_PASSWORD=ases_dev
+      - POSTGRES_DB=ases_development
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ases"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ases-redis-dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_dev:/data
+    command: redis-server --appendonly yes
+
+  agent:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile.dev
+    container_name: ases-agent-dev
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - VERCEL_TOKEN=${VERCEL_TOKEN:-}
+      - DATABASE_URL=postgresql://ases:ases_dev@postgres:5432/ases_development
+      - REDIS_URL=redis://redis:6379/0
+      - SANDBOX_BASE_DIR=/tmp/ases-sandboxes
+    volumes:
+      - ./agent_service:/app:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent_sandboxes:/tmp/ases-sandboxes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: ases-n8n-dev
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_HOST=localhost
+      - WEBHOOK_URL=http://localhost:5678/
+      - AGENT_SERVICE_URL=http://agent:8000
+      - EXECUTIONS_MODE=regular
+    volumes:
+      - n8n_dev:/home/node/.n8n
+    depends_on:
+      - agent
+
+volumes:
+  postgres_dev:
+  redis_dev:
+  n8n_dev:
+  agent_sandboxes:

@@ -1,0 +1,696 @@
+{
+  "name": "ASES Orchestrator v2.5",
+  "nodes": [
+    {
+      "id": "trigger-schedule",
+      "name": "📅 Schedule Trigger (30min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 30 }]
+        }
+      }
+    },
+    {
+      "id": "fetch-rss",
+      "name": "🌐 Fetch Job RSS Feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [450, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.UPWORK_RSS_URL }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse-rss",
+      "name": "🔧 Parse RSS → JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const xml = $input.first().json.data;\nconst items = [];\nconst itemRegex = /<item>[\\s\\S]*?<\\/item>/g;\nlet itemMatch;\nwhile ((itemMatch = itemRegex.exec(xml)) !== null) {\n  const item = itemMatch[0];\n  const titleMatch = item.match(/<title>(.*?)<\\/title>/);\n  const linkMatch = item.match(/<link>(.*?)<\\/link>/);\n  const descMatch = item.match(/<description>(.*?)<\\/description>/);\n  const dateMatch = item.match(/<pubDate>(.*?)<\\/pubDate>/);\n  const title = titleMatch ? titleMatch[1].replace(/<![CDATA[(.*?)]]]>/g, '$1').trim() : 'No Title';\n  const link = linkMatch ? linkMatch[1].trim() : '';\n  let desc = descMatch ? descMatch[1].replace(/<![CDATA[(.*?)]]]>/g, '$1') : '';\n  desc = desc.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();\n  const pubDate = dateMatch ? dateMatch[1].trim() : '';\n  let jobId = link;\n  try {\n    const url = new URL(link);\n    jobId = url.searchParams.get('~') || url.pathname.split('/').pop() || link;\n  } catch(e) {\n    jobId = link.split('/').pop().split('?')[0] || link;\n  }\n  items.push({\n    json: {\n      jobId,\n      title,\n      description: desc.substring(0, 1200),\n      link,\n      pubDate,\n      rawDate: new Date().toISOString()\n    }\n  });\n}\nreturn items;"
+      }
+    },
+    {
+      "id": "split-batches",
+      "name": "🔄 Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [850, 300],
+      "parameters": { "batchSize": 1, "options": {} }
+    },
+    {
+      "id": "call-agent-service",
+      "name": "🤖 Call Agent Service (Score + Proposal)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_SERVICE_URL }}/process-job",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  job_id: $json.jobId,\n  title: $json.title,\n  description: $json.description,\n  link: $json.link,\n  pub_date: $json.pubDate,\n  tenant_id: $env.TENANT_ID || 'default'\n}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "check-bid",
+      "name": "❓ Should Bid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "should-bid",
+              "leftValue": "={{ $json.should_bid }}",
+              "rightValue": "true",
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "send-hitl-prompt",
+      "name": "📱 Send HITL Approval Prompt",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1450, 200],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "🚀 *New Lead — Score {{ $json.score }}/10*\n\n*Title:* {{ $json.title }}\n*Link:* {{ $json.link }}\n*Why:* {{ $json.reason }}\n\n*Proposal:*\n{{ $json.proposal }}\n\n⬇️ Approve or reject below.",
+        "additionalOptions": {
+          "parse_mode": "Markdown",
+          "reply_markup": {
+            "inline_keyboard": [
+              [
+                {
+                  "text": "✅ APPROVE & BID",
+                  "callback_data": "={{ 'approve:' + $json.job_id }}"
+                },
+                {
+                  "text": "❌ REJECT",
+                  "callback_data": "={{ 'reject:' + $json.job_id }}"
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "telegramApi": { "id": "telegram-bot-api", "name": "Telegram Bot API" }
+      }
+    },
+    {
+      "id": "log-to-db-pending",
+      "name": "📝 Log Lead to PostgreSQL (pending)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [1650, 200],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO jobs (tenant_id, job_id, title, description, link, score, reason, proposal, status, created_at)\nVALUES ('{{ $env.TENANT_ID }}', '{{ $json.job_id }}', $1, $2, '{{ $json.link }}', {{ $json.score }}, $3, $4, 'pending_approval', NOW())\nON CONFLICT (tenant_id, job_id) DO NOTHING;",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+    {
+      "id": "log-to-db-skipped",
+      "name": "📝 Log Lead to PostgreSQL (skipped)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [1450, 400],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO jobs (tenant_id, job_id, title, description, link, score, reason, proposal, status, created_at)\nVALUES ('{{ $env.TENANT_ID }}', '{{ $json.job_id }}', $1, $2, '{{ $json.link }}', {{ $json.score }}, $3, '', 'skipped_low_score', NOW())\nON CONFLICT (tenant_id, job_id) DO NOTHING;",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+
+    {
+      "id": "telegram-callback",
+      "name": "📨 Telegram Callback Query Listener",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [250, 700],
+      "parameters": {
+        "updates": ["callback_query"],
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": { "id": "telegram-bot-api", "name": "Telegram Bot API" }
+      }
+    },
+    {
+      "id": "parse-callback",
+      "name": "🔍 Parse Callback Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 700],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const cb = $input.first().json.callback_query;\nconst data = cb?.data || '';\nconst chatId = cb?.message?.chat?.id;\nconst messageId = cb?.message?.message_id;\nconst callbackQueryId = cb?.id;\nconst parts = data.split(':');\nconst action = parts[0];\nconst jobId = parts[1];\nconst isApprove = action === 'approve';\nreturn [{ json: { action, jobId, chatId, messageId, callbackQueryId, isApprove } }];"
+      }
+    },
+    {
+      "id": "answer-callback",
+      "name": "✅ Answer Callback (dismiss spinner)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [650, 700],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/answerCallbackQuery",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ callback_query_id: $json.callbackQueryId, text: $json.isApprove ? '✅ Approved! Submitting...' : '❌ Rejected.' }) }}"
+      }
+    },
+    {
+      "id": "route-approval",
+      "name": "❓ Is Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [850, 700],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "is-approve",
+              "leftValue": "={{ $json.isApprove }}",
+              "rightValue": "true",
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "load-job-from-db",
+      "name": "🗄️ Load Job Proposal from DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [1050, 620],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT job_id, title, link, proposal FROM jobs WHERE tenant_id = '{{ $env.TENANT_ID }}' AND job_id = '{{ $json.jobId }}' LIMIT 1;"
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+    {
+      "id": "puppeteer-submit",
+      "name": "🤖 Puppeteer: Submit Proposal",
+      "type": "n8n-nodes-puppeteer.customScript",
+      "typeVersion": 1,
+      "position": [1250, 620],
+      "parameters": {
+        "code": "const { page, browser } = $puppeteer;\nconst job = $input.first().json;\nawait page.goto(job.link, { waitUntil: 'networkidle2', timeout: 30000 });\n// --- Upwork login check ---\nconst isLoggedIn = await page.$('.nav-logged-in') !== null;\nif (!isLoggedIn) {\n  await page.goto('https://www.upwork.com/ab/account-security/login');\n  await page.type('#login_username', process.env.UPWORK_EMAIL, { delay: 50 });\n  await page.click('#login_password_continue');\n  await page.waitForSelector('#login_password', { timeout: 8000 });\n  await page.type('#login_password', process.env.UPWORK_PASSWORD, { delay: 50 });\n  await page.click('#login_control_continue');\n  await page.waitForNavigation({ timeout: 15000 });\n}\n// --- Fill proposal ---\nawait page.waitForSelector('[data-cy=cover-letter-text]', { timeout: 10000 });\nawait page.click('[data-cy=cover-letter-text]');\nawait page.keyboard.down('Control');\nawait page.keyboard.press('A');\nawait page.keyboard.up('Control');\nawait page.type('[data-cy=cover-letter-text]', job.proposal, { delay: 20 });\n// --- Screenshot before submit ---\nconst screenshot = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: 80 });\nreturn [{ json: { jobId: job.job_id, jobLink: job.link, screenshot, submitted: false, pendingConfirm: true } }];",
+        "options": {}
+      }
+    },
+    {
+      "id": "screenshot-to-telegram",
+      "name": "📸 Screenshot → Telegram (final confirm)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1450, 620],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendPhoto",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "binaryData": false,
+        "photoUrl": "=data:image/jpeg;base64,{{ $json.screenshot }}",
+        "additionalOptions": {
+          "caption": "📋 Proposal filled for {{ $json.jobLink }}.\n\nReply CONFIRM to actually click Submit, or ABORT to leave.",
+          "parse_mode": "Markdown"
+        }
+      },
+      "credentials": {
+        "telegramApi": { "id": "telegram-bot-api", "name": "Telegram Bot API" }
+      }
+    },
+    {
+      "id": "update-status-approved",
+      "name": "📝 Update Job Status → approved",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [1650, 620],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status = 'approved_pending_submit', updated_at = NOW() WHERE tenant_id = '{{ $env.TENANT_ID }}' AND job_id = '{{ $json.jobId }}';"
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+    {
+      "id": "notify-rejected",
+      "name": "📱 Notify: Rejected",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [1050, 820],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "❌ Job {{ $json.jobId }} rejected. Skipping.",
+        "additionalOptions": {}
+      },
+      "credentials": {
+        "telegramApi": { "id": "telegram-bot-api", "name": "Telegram Bot API" }
+      }
+    },
+    {
+      "id": "update-status-rejected",
+      "name": "📝 Update Job Status → rejected",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [1250, 820],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status = 'rejected', updated_at = NOW() WHERE tenant_id = '{{ $env.TENANT_ID }}' AND job_id = '{{ $json.jobId }}';"
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+
+    {
+      "id": "cold-outreach-trigger",
+      "name": "📅 Weekly Cold Outreach Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 1100],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "weeks", "weeksInterval": 1 }]
+        }
+      }
+    },
+    {
+      "id": "fetch-cold-leads",
+      "name": "🗄️ Fetch Cold Leads from DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [450, 1100],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, email, company, notes FROM cold_leads WHERE tenant_id = '{{ $env.TENANT_ID }}' AND outreach_status = 'pending' AND (last_contacted_at IS NULL OR last_contacted_at < NOW() - INTERVAL '14 days') LIMIT 50;"
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+    {
+      "id": "split-cold-leads",
+      "name": "🔄 Split Cold Leads",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [650, 1100],
+      "parameters": { "batchSize": 1, "options": {} }
+    },
+    {
+      "id": "ai-personalize-email",
+      "name": "🤖 AI Personalize Cold Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [850, 1100],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_SERVICE_URL }}/personalize-email",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ lead_id: $json.id, name: $json.name, company: $json.company, notes: $json.notes, tenant_id: $env.TENANT_ID }) }}"
+      }
+    },
+    {
+      "id": "send-cold-email",
+      "name": "📧 Send via SendGrid",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 1,
+      "position": [1050, 1100],
+      "parameters": {
+        "operation": "send",
+        "toEmail": "={{ $json.email }}",
+        "fromEmail": "={{ $env.OUTREACH_FROM_EMAIL }}",
+        "subject": "={{ $json.subject }}",
+        "contentType": "plaintext",
+        "content": "={{ $json.body }}"
+      },
+      "credentials": {
+        "sendGridApi": { "id": "sendgrid-api", "name": "SendGrid API" }
+      }
+    },
+    {
+      "id": "log-outreach-db",
+      "name": "📝 Log Outreach to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [1250, 1100],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE cold_leads SET outreach_status = 'contacted', last_contacted_at = NOW() WHERE id = {{ $json.lead_id }} AND tenant_id = '{{ $env.TENANT_ID }}';"
+      },
+      "credentials": {
+        "postgres": { "id": "postgres-db", "name": "PostgreSQL" }
+      }
+    },
+
+    {
+      "id": "crm-webhook",
+      "name": "📥 CRM Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 1400],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crm-update",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "crm-route",
+      "name": "🔀 Route CRM Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [450, 1400],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": { "conditions": [{ "id": "new-client", "leftValue": "={{ $json.action }}", "rightValue": "new_client", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" },
+              "renameOutput": true,
+              "outputKey": "new_client"
+            },
+            {
+              "conditions": { "conditions": [{ "id": "update-status", "leftValue": "={{ $json.action }}", "rightValue": "update_status", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" },
+              "renameOutput": true,
+              "outputKey": "update_status"
+            },
+            {
+              "conditions": { "conditions": [{ "id": "add-note", "leftValue": "={{ $json.action }}", "rightValue": "add_note", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" },
+              "renameOutput": true,
+              "outputKey": "add_note"
+            },
+            {
+              "conditions": { "conditions": [{ "id": "invoice-paid", "leftValue": "={{ $json.action }}", "rightValue": "invoice_paid", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" },
+              "renameOutput": true,
+              "outputKey": "invoice_paid"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "crm-add-client",
+      "name": "📝 Add New Client to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [700, 1280],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO clients (tenant_id, name, email, company, status, created_at) VALUES ('{{ $env.TENANT_ID }}', '{{ $json.name }}', '{{ $json.email }}', '{{ $json.company }}', 'active', NOW()) ON CONFLICT (tenant_id, email) DO NOTHING RETURNING id;"
+      },
+      "credentials": { "postgres": { "id": "postgres-db", "name": "PostgreSQL" } }
+    },
+    {
+      "id": "crm-welcome-email",
+      "name": "🎉 Welcome Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 1,
+      "position": [900, 1280],
+      "parameters": {
+        "operation": "send",
+        "toEmail": "={{ $json.email }}",
+        "fromEmail": "={{ $env.OUTREACH_FROM_EMAIL }}",
+        "subject": "Welcome aboard, {{ $json.name }}!",
+        "contentType": "plaintext",
+        "content": "Hi {{ $json.name }},\n\nExcited to work with you! I'll be in touch shortly to kick things off.\n\nBest,"
+      },
+      "credentials": { "sendGridApi": { "id": "sendgrid-api", "name": "SendGrid API" } }
+    },
+    {
+      "id": "crm-update-status",
+      "name": "🔄 Update Client Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [700, 1400],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE clients SET status = '{{ $json.status }}', updated_at = NOW() WHERE tenant_id = '{{ $env.TENANT_ID }}' AND email = '{{ $json.email }}';"
+      },
+      "credentials": { "postgres": { "id": "postgres-db", "name": "PostgreSQL" } }
+    },
+    {
+      "id": "crm-status-notify",
+      "name": "📊 Status Change Notification",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [900, 1400],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "📊 Client *{{ $json.email }}* status → `{{ $json.status }}`",
+        "additionalOptions": { "parse_mode": "Markdown" }
+      },
+      "credentials": { "telegramApi": { "id": "telegram-bot-api", "name": "Telegram Bot API" } }
+    },
+    {
+      "id": "crm-add-note",
+      "name": "📝 Append Note to Client",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [700, 1520],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO client_notes (tenant_id, client_email, note, created_at) VALUES ('{{ $env.TENANT_ID }}', '{{ $json.email }}', '{{ $json.note }}', NOW());"
+      },
+      "credentials": { "postgres": { "id": "postgres-db", "name": "PostgreSQL" } }
+    },
+    {
+      "id": "crm-log-payment",
+      "name": "💰 Log Payment",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.2,
+      "position": [700, 1640],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO payments (tenant_id, client_email, amount_usd, invoice_id, paid_at) VALUES ('{{ $env.TENANT_ID }}', '{{ $json.email }}', {{ $json.amount }}, '{{ $json.invoice_id }}', NOW());"
+      },
+      "credentials": { "postgres": { "id": "postgres-db", "name": "PostgreSQL" } }
+    },
+    {
+      "id": "crm-payment-notify",
+      "name": "💸 Payment Celebration",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [900, 1640],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "💸 Payment received: *${{ $json.amount }}* from {{ $json.email }} 🎉",
+        "additionalOptions": { "parse_mode": "Markdown" }
+      },
+      "credentials": { "telegramApi": { "id": "telegram-bot-api", "name": "Telegram Bot API" } }
+    },
+
+    {
+      "id": "dev-webhook",
+      "name": "🛠️ Dev Task Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 1800],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dev-task",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "call-dev-agent",
+      "name": "🤖 Call Dev Agent Service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [450, 1800],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_SERVICE_URL }}/dev-task",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 300000
+        }
+      }
+    },
+    {
+      "id": "dev-response",
+      "name": "📤 Return Dev Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [650, 1800],
+      "parameters": {
+        "options": {
+          "responseCode": 200,
+          "responseData": "={{ JSON.stringify($json) }}"
+        }
+      }
+    },
+    {
+      "id": "note-architecture",
+      "name": "NOTE: Architecture v2.5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [250, 80],
+      "parameters": {
+        "content": "## ASES Orchestrator v2.5\n\n**What changed from FIXED.json:**\n- ✅ HITL inline keyboard (approve/reject) gates Puppeteer — no auto-submit\n- ✅ Google Sheets REMOVED — PostgreSQL upserts everywhere\n- ✅ Fake test runner REMOVED — all dev tests run in real Docker sandbox via agent_service\n- ✅ GitHub Gist REMOVED — agent_service handles real git commit/push\n- ✅ Cold outreach uses DB (not Sheets)\n- ✅ All CRM branches wired to real DB nodes\n- ✅ Timeout extended to 5min on dev-task call\n\n**Required env vars:** AGENT_SERVICE_URL, TENANT_ID, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN, OUTREACH_FROM_EMAIL",
+        "height": 180,
+        "width": 900
+      }
+    },
+    {
+      "id": "note-hitl",
+      "name": "NOTE: HITL Flow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [250, 580],
+      "parameters": {
+        "content": "## Human-in-the-Loop Gate\n\nFlow: Score ≥ threshold → Inline keyboard alert → User taps APPROVE/REJECT\n→ Callback listener parses decision → APPROVE: load proposal from DB → Puppeteer fills form → Screenshot sent for final CONFIRM before click\n→ REJECT: DB updated, notification sent\n\n**Puppeteer still requires a CONFIRM reply after screenshot** — two-stage safety.",
+        "height": 120,
+        "width": 700
+      }
+    }
+  ],
+  "connections": {
+    "📅 Schedule Trigger (30min)": {
+      "main": [[{ "node": "🌐 Fetch Job RSS Feed", "type": "main", "index": 0 }]]
+    },
+    "🌐 Fetch Job RSS Feed": {
+      "main": [[{ "node": "🔧 Parse RSS → JSON", "type": "main", "index": 0 }]]
+    },
+    "🔧 Parse RSS → JSON": {
+      "main": [[{ "node": "🔄 Split In Batches", "type": "main", "index": 0 }]]
+    },
+    "🔄 Split In Batches": {
+      "main": [[{ "node": "🤖 Call Agent Service (Score + Proposal)", "type": "main", "index": 0 }]]
+    },
+    "🤖 Call Agent Service (Score + Proposal)": {
+      "main": [[{ "node": "❓ Should Bid?", "type": "main", "index": 0 }]]
+    },
+    "❓ Should Bid?": {
+      "main": [
+        [{ "node": "📱 Send HITL Approval Prompt", "type": "main", "index": 0 }],
+        [{ "node": "📝 Log Lead to PostgreSQL (skipped)", "type": "main", "index": 0 }]
+      ]
+    },
+    "📱 Send HITL Approval Prompt": {
+      "main": [[{ "node": "📝 Log Lead to PostgreSQL (pending)", "type": "main", "index": 0 }]]
+    },
+    "📨 Telegram Callback Query Listener": {
+      "main": [[{ "node": "🔍 Parse Callback Data", "type": "main", "index": 0 }]]
+    },
+    "🔍 Parse Callback Data": {
+      "main": [[{ "node": "✅ Answer Callback (dismiss spinner)", "type": "main", "index": 0 }]]
+    },
+    "✅ Answer Callback (dismiss spinner)": {
+      "main": [[{ "node": "❓ Is Approved?", "type": "main", "index": 0 }]]
+    },
+    "❓ Is Approved?": {
+      "main": [
+        [{ "node": "🗄️ Load Job Proposal from DB", "type": "main", "index": 0 }],
+        [{ "node": "📱 Notify: Rejected", "type": "main", "index": 0 }]
+      ]
+    },
+    "🗄️ Load Job Proposal from DB": {
+      "main": [[{ "node": "🤖 Puppeteer: Submit Proposal", "type": "main", "index": 0 }]]
+    },
+    "🤖 Puppeteer: Submit Proposal": {
+      "main": [[{ "node": "📸 Screenshot → Telegram (final confirm)", "type": "main", "index": 0 }]]
+    },
+    "📸 Screenshot → Telegram (final confirm)": {
+      "main": [[{ "node": "📝 Update Job Status → approved", "type": "main", "index": 0 }]]
+    },
+    "📱 Notify: Rejected": {
+      "main": [[{ "node": "📝 Update Job Status → rejected", "type": "main", "index": 0 }]]
+    },
+    "📅 Weekly Cold Outreach Trigger": {
+      "main": [[{ "node": "🗄️ Fetch Cold Leads from DB", "type": "main", "index": 0 }]]
+    },
+    "🗄️ Fetch Cold Leads from DB": {
+      "main": [[{ "node": "🔄 Split Cold Leads", "type": "main", "index": 0 }]]
+    },
+    "🔄 Split Cold Leads": {
+      "main": [[{ "node": "🤖 AI Personalize Cold Email", "type": "main", "index": 0 }]]
+    },
+    "🤖 AI Personalize Cold Email": {
+      "main": [[{ "node": "📧 Send via SendGrid", "type": "main", "index": 0 }]]
+    },
+    "📧 Send via SendGrid": {
+      "main": [[{ "node": "📝 Log Outreach to DB", "type": "main", "index": 0 }]]
+    },
+    "📥 CRM Webhook": {
+      "main": [[{ "node": "🔀 Route CRM Action", "type": "main", "index": 0 }]]
+    },
+    "🔀 Route CRM Action": {
+      "main": [
+        [{ "node": "📝 Add New Client to DB", "type": "main", "index": 0 }],
+        [{ "node": "🔄 Update Client Status", "type": "main", "index": 0 }],
+        [{ "node": "📝 Append Note to Client", "type": "main", "index": 0 }],
+        [{ "node": "💰 Log Payment", "type": "main", "index": 0 }]
+      ]
+    },
+    "📝 Add New Client to DB": {
+      "main": [[{ "node": "🎉 Welcome Email", "type": "main", "index": 0 }]]
+    },
+    "🔄 Update Client Status": {
+      "main": [[{ "node": "📊 Status Change Notification", "type": "main", "index": 0 }]]
+    },
+    "💰 Log Payment": {
+      "main": [[{ "node": "💸 Payment Celebration", "type": "main", "index": 0 }]]
+    },
+    "🛠️ Dev Task Webhook": {
+      "main": [[{ "node": "🤖 Call Dev Agent Service", "type": "main", "index": 0 }]]
+    },
+    "🤖 Call Dev Agent Service": {
+      "main": [[{ "node": "📤 Return Dev Result", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 3600,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["ases", "production", "v2.5"],
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "n8nVersion": "1.44.0",
+    "instanceId": "ases-production"
+  }
+}
